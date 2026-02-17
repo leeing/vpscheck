@@ -189,6 +189,53 @@ def fetch(
         return None
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Handler that prevents automatic redirect following (curl -s without -L)."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        return None
+
+
+def fetch_no_redirect(
+    opener: urllib.request.OpenerDirector,
+    url: str,
+    headers: dict[str, str] | None = None,
+    timeout: int = TIMEOUT,
+) -> Response | None:
+    """GET a URL without following redirects (faithful to curl -s without -L).
+
+    Builds a one-off opener that inherits the source-address-bound handlers
+    from the original opener but adds _NoRedirectHandler to suppress redirects.
+    """
+    hdrs = {"User-Agent": UA_BROWSER}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, headers=hdrs)
+
+    # Build a new opener with the same handlers + no-redirect handler
+    no_redir_opener = urllib.request.build_opener(
+        *[h for h in opener.handlers if not isinstance(h, urllib.request.HTTPRedirectHandler)],
+        _NoRedirectHandler,
+    )
+    try:
+        resp = no_redir_opener.open(req, timeout=timeout)
+        body = resp.read().decode("utf-8", errors="replace")
+        return Response(resp.status, body, resp.url)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return Response(e.code, body, url)
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return None
+
+
 def check_connectivity(opener: urllib.request.OpenerDirector) -> bool:
     resp = fetch(opener, "https://www.google.com/generate_204", timeout=5)
     return resp is not None
@@ -303,7 +350,13 @@ def check_apple_region(ctx: CheckContext) -> CheckResult:
     Empty → Failed, otherwise shows the result.
     """
     name = "Apple Region"
-    resp = fetch(ctx.opener, "https://gspe1-ssl.ls.apple.com/pep/gcc")
+    # Bash uses curl -sL WITHOUT --user-agent, so curl sends its default UA.
+    # We replicate this by sending a curl-like User-Agent, not the browser UA.
+    resp = fetch(
+        ctx.opener,
+        "https://gspe1-ssl.ls.apple.com/pep/gcc",
+        headers={"User-Agent": "curl/8.7.1"},
+    )
     if resp is None:
         return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
@@ -361,11 +414,12 @@ def check_chatgpt(ctx: CheckContext) -> CheckResult:
         "upgrade-insecure-requests": "1",
     }
 
-    resp1 = fetch(ctx.opener, "https://api.openai.com/compliance/cookie_requirements", headers=headers1)
+    # Bash uses curl -s (no -L), so no redirect following for both requests.
+    resp1 = fetch_no_redirect(ctx.opener, "https://api.openai.com/compliance/cookie_requirements", headers=headers1)
     if resp1 is None or not resp1.text:
         return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
-    resp2 = fetch(ctx.opener, "https://ios.chat.openai.com/", headers=headers2)
+    resp2 = fetch_no_redirect(ctx.opener, "https://ios.chat.openai.com/", headers=headers2)
     if resp2 is None or not resp2.text:
         return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
