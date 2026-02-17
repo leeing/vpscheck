@@ -536,46 +536,7 @@ def check_claude(ctx: CheckContext) -> CheckResult:
 
 
 # --------------------------------------------------------------------------- #
-# 7. WebTest_GooglePlayStore (check.sh L1727)
-# --------------------------------------------------------------------------- #
-def check_google_play(ctx: CheckContext) -> CheckResult:
-    """Faithful port of WebTest_GooglePlayStore.
-
-    Bash: curl -sL 'https://play.google.com/' with Chrome 131 headers,
-          then grep -oP '<div class="yVZQTb">\\K[^<(]+'
-    Shows the extracted region name, or Failed if empty.
-    """
-    name = "Google Play Store"
-    headers = {
-        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "accept-language": "en-US;q=0.9",
-        "priority": "u=0, i",
-        "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24", "Google Chrome";v="131"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
-        "sec-fetch-dest": "document",
-        "sec-fetch-mode": "navigate",
-        "sec-fetch-site": "none",
-        "sec-fetch-user": "?1",
-        "upgrade-insecure-requests": "1",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    }
-    # Google Play page is ~1.3MB; give VPS with low bandwidth more time
-    resp = fetch(ctx.opener, "https://play.google.com/", headers=headers, timeout=15)
-    if resp is None:
-        return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
-
-    # grep -oP '<div class="yVZQTb">\K[^<(]+'
-    m = re.search(r'<div class="yVZQTb">([^<(]+)', resp.text)
-    result = m.group(1).strip() if m else ""
-
-    if not result:
-        return CheckResult(name, CheckStatus.FAILED)
-    return CheckResult(name, CheckStatus.OK, region=result)
-
-
-# --------------------------------------------------------------------------- #
-# 8. WebTest_GoogleSearchCAPTCHA (check.sh L1789)
+# 7. WebTest_GoogleSearchCAPTCHA (check.sh L1789)
 # --------------------------------------------------------------------------- #
 def check_google_captcha(ctx: CheckContext) -> CheckResult:
     """Faithful port of WebTest_GoogleSearchCAPTCHA.
@@ -640,7 +601,6 @@ ALL_CHECKS: list[CheckFn] = [
     check_chatgpt,
     check_gemini,
     check_claude,
-    check_google_play,
     check_google_captcha,
 ]
 

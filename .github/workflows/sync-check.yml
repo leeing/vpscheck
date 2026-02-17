@@ -32,7 +32,7 @@ jobs:
               "WebTest_OpenAI",
               "WebTest_Gemini",
               "WebTest_Claude",
-              "WebTest_GooglePlayStore",
+
               "WebTest_GoogleSearchCAPTCHA",
           ]
 
