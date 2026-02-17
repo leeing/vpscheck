@@ -1,38 +1,30 @@
 #!/usr/bin/env python3
-# /// script
-# requires-python = ">=3.10"
-# dependencies = ["httpx", "rich"]
-# ///
 """VPS Service Unlock Checker.
 
-Checks whether a VPS can access major services without restrictions.
-Supports dual-stack IPv4/IPv6 testing.
+Zero dependencies — uses only Python 3.10+ standard library.
 
 Usage:
-    uv run check.py          # test both IPv4 and IPv6
-    uv run check.py -4       # IPv4 only
-    uv run check.py -6       # IPv6 only
-    uv run check.py -I eth0  # bind to specific interface
+    python3 check.py          # test both IPv4 and IPv6
+    python3 check.py -4       # IPv4 only
+    python3 check.py -6       # IPv6 only
+    python3 check.py -I eth0  # bind to specific interface
 """
 from __future__ import annotations
 
 import argparse
-import asyncio
+import concurrent.futures
+import http.client
 import ipaddress
+import json
 import re
-import socket
+import ssl
 import subprocess
 import sys
-from collections.abc import Awaitable
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable
-
-import httpx
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -42,7 +34,16 @@ UA_BROWSER = (
 )
 UA_SEC_CH_UA = '"Chromium";v="125", "Not-A.Brand";v="24"'
 
-DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=15.0, write=10.0, pool=10.0)
+TIMEOUT = 15
+
+# ANSI escape codes
+C_GREEN = "\033[32m"
+C_RED = "\033[31m"
+C_YELLOW = "\033[33m"
+C_CYAN = "\033[36m"
+C_BOLD = "\033[1m"
+C_DIM = "\033[2m"
+C_RESET = "\033[0m"
 
 
 # ── Data Models ────────────────────────────────────────────────────────────────
@@ -60,6 +61,13 @@ class CheckResult:
     status: CheckStatus
     region: str = ""
     detail: str = ""
+
+
+@dataclass
+class Response:
+    status_code: int
+    text: str
+    url: str
 
 
 @dataclass
@@ -81,7 +89,7 @@ class IPInfo:
 
 @dataclass
 class CheckContext:
-    client: httpx.AsyncClient
+    opener: urllib.request.OpenerDirector
     is_ipv6: bool = False
 
 
@@ -113,40 +121,93 @@ def resolve_interface(name: str, ipv6: bool) -> str:
     sys.exit(f"Error: cannot resolve interface '{name}' to {'IPv6' if ipv6 else 'IPv4'} address")
 
 
-# ── HTTP & Network ─────────────────────────────────────────────────────────────
+# ── HTTP Layer (stdlib) ───────────────────────────────────────────────────────
 
-def create_client(local_address: str) -> httpx.AsyncClient:
-    transport = httpx.AsyncHTTPTransport(local_address=local_address, retries=2)
-    return httpx.AsyncClient(
-        transport=transport,
-        timeout=DEFAULT_TIMEOUT,
-        follow_redirects=True,
-        headers={"User-Agent": UA_BROWSER},
+
+class _BoundHTTPSHandler(urllib.request.HTTPSHandler):
+    """HTTPS handler that binds to a specific source address."""
+
+    def __init__(self, source_address: tuple[str, int] | None = None) -> None:
+        ctx = ssl.create_default_context()
+        super().__init__(context=ctx)
+        self._source_address = source_address
+
+    def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(self._conn, req, context=self._context)
+
+    def _conn(self, host: str, **kwargs: object) -> http.client.HTTPSConnection:
+        kwargs["source_address"] = self._source_address  # type: ignore[assignment]
+        return http.client.HTTPSConnection(host, **kwargs)  # type: ignore[arg-type]
+
+
+class _BoundHTTPHandler(urllib.request.HTTPHandler):
+    """HTTP handler that binds to a specific source address."""
+
+    def __init__(self, source_address: tuple[str, int] | None = None) -> None:
+        super().__init__()
+        self._source_address = source_address
+
+    def http_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
+        return self.do_open(self._conn, req)
+
+    def _conn(self, host: str, **kwargs: object) -> http.client.HTTPConnection:
+        kwargs["source_address"] = self._source_address  # type: ignore[assignment]
+        return http.client.HTTPConnection(host, **kwargs)  # type: ignore[arg-type]
+
+
+def create_opener(local_address: str) -> urllib.request.OpenerDirector:
+    """Build a urllib opener bound to the given local address."""
+    if local_address in ("0.0.0.0", "::"):
+        source: tuple[str, int] | None = (local_address, 0)
+    else:
+        source = (local_address, 0)
+    return urllib.request.build_opener(
+        _BoundHTTPHandler(source_address=source),
+        _BoundHTTPSHandler(source_address=source),
     )
 
 
-async def check_connectivity(client: httpx.AsyncClient) -> bool:
+def fetch(
+    opener: urllib.request.OpenerDirector,
+    url: str,
+    headers: dict[str, str] | None = None,
+    timeout: int = TIMEOUT,
+) -> Response | None:
+    """GET a URL; returns Response on success (including 4xx/5xx), None on error."""
+    hdrs = {"User-Agent": UA_BROWSER}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, headers=hdrs)
     try:
-        await client.get("https://www.google.com/generate_204", timeout=5)
-        return True
-    except httpx.HTTPError:
-        return False
+        resp = opener.open(req, timeout=timeout)
+        body = resp.read().decode("utf-8", errors="replace")
+        return Response(resp.status, body, resp.url)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        return Response(e.code, body, url)
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return None
 
 
-async def get_ip_info(client: httpx.AsyncClient) -> IPInfo:
+def check_connectivity(opener: urllib.request.OpenerDirector) -> bool:
+    resp = fetch(opener, "https://www.google.com/generate_204", timeout=5)
+    return resp is not None
+
+
+def get_ip_info(opener: urllib.request.OpenerDirector) -> IPInfo:
     info = IPInfo()
-    try:
-        resp = await client.get("https://api64.ipify.org", timeout=5)
-        info.ip = resp.text.strip()
-    except httpx.HTTPError:
+    resp = fetch(opener, "https://api64.ipify.org", timeout=5)
+    if resp is None:
         return info
-    try:
-        resp = await client.get(f"https://api.ip.sb/geoip/{info.ip}", timeout=5)
-        data = resp.json()
-        info.isp = data.get("isp", "")
-        info.country = data.get("country", "")
-    except (httpx.HTTPError, ValueError):
-        pass
+    info.ip = resp.text.strip()
+    resp2 = fetch(opener, f"https://api.ip.sb/geoip/{info.ip}", timeout=5)
+    if resp2 is not None:
+        try:
+            data = json.loads(resp2.text)
+            info.isp = data.get("isp", "")
+            info.country = data.get("country", "")
+        except (json.JSONDecodeError, KeyError):
+            pass
     return info
 
 
@@ -157,7 +218,7 @@ async def get_ip_info(client: httpx.AsyncClient) -> IPInfo:
 # --------------------------------------------------------------------------- #
 # 1. WebTest_Reddit (check.sh L3701)
 # --------------------------------------------------------------------------- #
-async def check_reddit(ctx: CheckContext) -> CheckResult:
+def check_reddit(ctx: CheckContext) -> CheckResult:
     """Faithful port of WebTest_Reddit.
 
     Bash: curl -fsL 'https://www.reddit.com/' -w %{http_code} -o /dev/null
@@ -166,9 +227,8 @@ async def check_reddit(ctx: CheckContext) -> CheckResult:
     name = "Reddit"
     if ctx.is_ipv6:
         return CheckResult(name, CheckStatus.WARNING, detail="IPv6 not supported")
-    try:
-        resp = await ctx.client.get("https://www.reddit.com/")
-    except httpx.HTTPError:
+    resp = fetch(ctx.opener, "https://www.reddit.com/")
+    if resp is None:
         return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
     match resp.status_code:
@@ -183,7 +243,7 @@ async def check_reddit(ctx: CheckContext) -> CheckResult:
 # --------------------------------------------------------------------------- #
 # 2. MediaUnlockTest_YouTube_Premium (check.sh L1694)
 # --------------------------------------------------------------------------- #
-async def check_youtube_premium(ctx: CheckContext) -> CheckResult:
+def check_youtube_premium(ctx: CheckContext) -> CheckResult:
     """Faithful port of MediaUnlockTest_YouTube_Premium.
 
     Bash: curl -sL 'https://www.youtube.com/premium'
@@ -205,14 +265,11 @@ async def check_youtube_premium(ctx: CheckContext) -> CheckResult:
             "__Secure-BUCKET=CGQ"
         ),
     }
-    try:
-        resp = await ctx.client.get("https://www.youtube.com/premium", headers=headers)
-    except httpx.HTTPError:
+    resp = fetch(ctx.opener, "https://www.youtube.com/premium", headers=headers)
+    if resp is None or not resp.text:
         return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
     text = resp.text
-    if not text:
-        return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
     # Check CN redirect
     if "www.google.cn" in text:
@@ -223,15 +280,13 @@ async def check_youtube_premium(ctx: CheckContext) -> CheckResult:
     region = m.group(1) if m else ""
 
     # Check not available
-    is_not_available = re.search(r"Premium is not available in your country", text, re.IGNORECASE)
-    if is_not_available:
+    if re.search(r"Premium is not available in your country", text, re.IGNORECASE):
         return CheckResult(name, CheckStatus.NO, region=region)
 
     # Check available
     if not region:
         region = "UNKNOWN"
-    is_available = re.search(r"ad-free", text, re.IGNORECASE)
-    if is_available:
+    if re.search(r"ad-free", text, re.IGNORECASE):
         return CheckResult(name, CheckStatus.OK, region=region)
 
     return CheckResult(name, CheckStatus.FAILED, detail="PAGE ERROR")
@@ -240,7 +295,7 @@ async def check_youtube_premium(ctx: CheckContext) -> CheckResult:
 # --------------------------------------------------------------------------- #
 # 3. RegionTest_Apple (check.sh L1738)
 # --------------------------------------------------------------------------- #
-async def check_apple_region(ctx: CheckContext) -> CheckResult:
+def check_apple_region(ctx: CheckContext) -> CheckResult:
     """Faithful port of RegionTest_Apple.
 
     Bash: curl -sL 'https://gspe1-ssl.ls.apple.com/pep/gcc'
@@ -248,9 +303,8 @@ async def check_apple_region(ctx: CheckContext) -> CheckResult:
     Empty → Failed, otherwise shows the result.
     """
     name = "Apple Region"
-    try:
-        resp = await ctx.client.get("https://gspe1-ssl.ls.apple.com/pep/gcc")
-    except httpx.HTTPError:
+    resp = fetch(ctx.opener, "https://gspe1-ssl.ls.apple.com/pep/gcc")
+    if resp is None:
         return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
     result = resp.text.strip()
@@ -262,16 +316,12 @@ async def check_apple_region(ctx: CheckContext) -> CheckResult:
 # --------------------------------------------------------------------------- #
 # 4. WebTest_OpenAI / ChatGPT (check.sh L4510)
 # --------------------------------------------------------------------------- #
-async def check_chatgpt(ctx: CheckContext) -> CheckResult:
+def check_chatgpt(ctx: CheckContext) -> CheckResult:
     """Faithful port of WebTest_OpenAI.
 
     Makes two requests:
       1) GET https://api.openai.com/compliance/cookie_requirements
-         with authority, authorization, content-type, origin, referer,
-         sec-ch-ua, sec-ch-ua-mobile, sec-ch-ua-platform, sec-fetch-* headers.
       2) GET https://ios.chat.openai.com/
-         with authority, accept, accept-language, sec-ch-ua, sec-ch-ua-mobile,
-         sec-ch-ua-platform, sec-fetch-*, upgrade-insecure-requests headers.
 
     Logic:
       result1 = grep 'unsupported_country' in resp1
@@ -311,31 +361,18 @@ async def check_chatgpt(ctx: CheckContext) -> CheckResult:
         "upgrade-insecure-requests": "1",
     }
 
-    try:
-        resp1 = await ctx.client.get(
-            "https://api.openai.com/compliance/cookie_requirements",
-            headers=headers1,
-        )
-    except httpx.HTTPError:
+    resp1 = fetch(ctx.opener, "https://api.openai.com/compliance/cookie_requirements", headers=headers1)
+    if resp1 is None or not resp1.text:
         return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
-    try:
-        resp2 = await ctx.client.get(
-            "https://ios.chat.openai.com/",
-            headers=headers2,
-        )
-    except httpx.HTTPError:
-        return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
-
-    text1 = resp1.text
-    text2 = resp2.text
-    if not text1 or not text2:
+    resp2 = fetch(ctx.opener, "https://ios.chat.openai.com/", headers=headers2)
+    if resp2 is None or not resp2.text:
         return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
     # grep -i 'unsupported_country'
-    has_unsupported = bool(re.search(r"unsupported_country", text1, re.IGNORECASE))
+    has_unsupported = bool(re.search(r"unsupported_country", resp1.text, re.IGNORECASE))
     # grep -i 'VPN'
-    has_vpn = bool(re.search(r"VPN", text2))
+    has_vpn = bool(re.search(r"VPN", resp2.text))
 
     if not has_unsupported and not has_vpn:
         return CheckResult(name, CheckStatus.OK)
@@ -352,7 +389,7 @@ async def check_chatgpt(ctx: CheckContext) -> CheckResult:
 # --------------------------------------------------------------------------- #
 # 5. WebTest_Gemini (check.sh L4544)
 # --------------------------------------------------------------------------- #
-async def check_gemini(ctx: CheckContext) -> CheckResult:
+def check_gemini(ctx: CheckContext) -> CheckResult:
     """Faithful port of WebTest_Gemini.
 
     Bash: curl -sL "https://gemini.google.com"
@@ -361,9 +398,8 @@ async def check_gemini(ctx: CheckContext) -> CheckResult:
     grep -o ',2,1,200,"[A-Z]{3}"' → extract country code.
     """
     name = "Google Gemini"
-    try:
-        resp = await ctx.client.get("https://gemini.google.com")
-    except httpx.HTTPError:
+    resp = fetch(ctx.opener, "https://gemini.google.com")
+    if resp is None:
         return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
     text = resp.text
@@ -390,7 +426,7 @@ async def check_gemini(ctx: CheckContext) -> CheckResult:
 # --------------------------------------------------------------------------- #
 # 6. WebTest_Claude (check.sh L4564)
 # --------------------------------------------------------------------------- #
-async def check_claude(ctx: CheckContext) -> CheckResult:
+def check_claude(ctx: CheckContext) -> CheckResult:
     """Faithful port of WebTest_Claude.
 
     Bash: curl -s -L -o /dev/null -w '%{url_effective}' "https://claude.ai/"
@@ -400,12 +436,11 @@ async def check_claude(ctx: CheckContext) -> CheckResult:
       else → Unknown (url)
     """
     name = "Claude"
-    try:
-        resp = await ctx.client.get("https://claude.ai/", follow_redirects=True)
-    except httpx.HTTPError:
+    resp = fetch(ctx.opener, "https://claude.ai/")
+    if resp is None:
         return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
-    final_url = str(resp.url)
+    final_url = resp.url
     if not final_url:
         return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
@@ -420,10 +455,10 @@ async def check_claude(ctx: CheckContext) -> CheckResult:
 # --------------------------------------------------------------------------- #
 # 7. WebTest_GooglePlayStore (check.sh L1727)
 # --------------------------------------------------------------------------- #
-async def check_google_play(ctx: CheckContext) -> CheckResult:
+def check_google_play(ctx: CheckContext) -> CheckResult:
     """Faithful port of WebTest_GooglePlayStore.
 
-    Bash: curl -sL 'https://play.google.com/' with extensive headers,
+    Bash: curl -sL 'https://play.google.com/' with Chrome 131 headers,
           then grep -oP '<div class="yVZQTb">\\K[^<(]+'
     Shows the extracted region name, or Failed if empty.
     """
@@ -442,14 +477,12 @@ async def check_google_play(ctx: CheckContext) -> CheckResult:
         "upgrade-insecure-requests": "1",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     }
-    try:
-        resp = await ctx.client.get("https://play.google.com/", headers=headers)
-    except httpx.HTTPError:
+    resp = fetch(ctx.opener, "https://play.google.com/", headers=headers)
+    if resp is None:
         return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
-    text = resp.text
     # grep -oP '<div class="yVZQTb">\K[^<(]+'
-    m = re.search(r'<div class="yVZQTb">([^<(]+)', text)
+    m = re.search(r'<div class="yVZQTb">([^<(]+)', resp.text)
     result = m.group(1).strip() if m else ""
 
     if not result:
@@ -460,7 +493,7 @@ async def check_google_play(ctx: CheckContext) -> CheckResult:
 # --------------------------------------------------------------------------- #
 # 8. WebTest_GoogleSearchCAPTCHA (check.sh L1789)
 # --------------------------------------------------------------------------- #
-async def check_google_captcha(ctx: CheckContext) -> CheckResult:
+def check_google_captcha(ctx: CheckContext) -> CheckResult:
     """Faithful port of WebTest_GoogleSearchCAPTCHA.
 
     Bash: curl -sL with full Google search URL and extensive headers.
@@ -491,14 +524,11 @@ async def check_google_captcha(ctx: CheckContext) -> CheckResult:
         "sec-fetch-user": "?1",
         "upgrade-insecure-requests": "1",
     }
-    try:
-        resp = await ctx.client.get(url, headers=headers)
-    except httpx.HTTPError:
+    resp = fetch(ctx.opener, url, headers=headers)
+    if resp is None or not resp.text:
         return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
     text = resp.text
-    if not text:
-        return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
     # grep -iE 'unusual traffic from|is blocked|unaddressed abuse'
     is_blocked = bool(re.search(r"unusual traffic from|is blocked|unaddressed abuse", text, re.IGNORECASE))
@@ -517,7 +547,7 @@ async def check_google_captcha(ctx: CheckContext) -> CheckResult:
 
 # ── Check Registry ────────────────────────────────────────────────────────────
 
-CheckFn = Callable[[CheckContext], Awaitable[CheckResult]]
+CheckFn = Callable[[CheckContext], CheckResult]
 
 ALL_CHECKS: list[CheckFn] = [
     check_reddit,
@@ -531,86 +561,85 @@ ALL_CHECKS: list[CheckFn] = [
 ]
 
 
-# ── Output Rendering ──────────────────────────────────────────────────────────
+# ── Output Rendering (ANSI) ──────────────────────────────────────────────────
 
-STATUS_STYLE = {
-    CheckStatus.OK: ("✅", "green"),
-    CheckStatus.NO: ("❌", "red"),
-    CheckStatus.FAILED: ("⚠️ ", "dim red"),
-    CheckStatus.WARNING: ("⚡", "yellow"),
+STATUS_MAP: dict[CheckStatus, tuple[str, str]] = {
+    CheckStatus.OK:      ("✅", C_GREEN),
+    CheckStatus.NO:      ("❌", C_RED),
+    CheckStatus.FAILED:  ("⚠️ ", C_DIM),
+    CheckStatus.WARNING: ("⚡", C_YELLOW),
 }
 
 
-def format_status(r: CheckResult) -> Text:
-    icon, color = STATUS_STYLE[r.status]
-    parts: list[str] = [icon]
+def format_status(r: CheckResult) -> str:
+    icon, color = STATUS_MAP[r.status]
 
     match r.status:
         case CheckStatus.OK:
-            parts.append("Yes")
+            label = "Yes"
             if r.region:
-                parts.append(f"(Region: {r.region})")
+                label += f" (Region: {r.region})"
         case CheckStatus.NO:
-            parts.append("No")
+            label = "No"
             if r.region:
-                parts.append(f"(Region: {r.region})")
+                label += f" (Region: {r.region})"
             elif r.detail:
-                parts.append(f"({r.detail})")
+                label += f" ({r.detail})"
         case CheckStatus.FAILED:
-            parts.append("Failed")
+            label = "Failed"
             if r.detail:
-                parts.append(f"({r.detail})")
+                label += f" ({r.detail})"
         case CheckStatus.WARNING:
-            if r.detail:
-                parts.append(r.detail)
-            else:
-                parts.append("Warning")
+            label = r.detail if r.detail else "Warning"
 
-    return Text(" ".join(parts), style=color)
+    return f"{color}{icon} {label}{C_RESET}"
 
 
 def render_results(
-    console: Console,
     results: list[CheckResult],
     ip_info: IPInfo,
     version: int,
 ) -> None:
-    header_lines = []
+    W = 62
+    BAR = "─" * (W - 2)
+
+    # Header box
     net_label = f"{ip_info.isp} ({ip_info.masked})" if ip_info.isp else ip_info.masked
-    header_lines.append(f"🌐  Network: {net_label}")
+    lines = [
+        f"  🌐  Network:  {net_label}",
+    ]
     if ip_info.country:
-        header_lines.append(f"🏳️   Country: {ip_info.country}")
-    header_lines.append(f"📡  Protocol: IPv{version}")
+        lines.append(f"  🏳️   Country:  {ip_info.country}")
+    lines.append(f"  📡  Protocol: IPv{version}")
 
-    console.print(Panel(
-        "\n".join(header_lines),
-        title=f"[bold cyan]VPS Unlock Checker — IPv{version}[/bold cyan]",
-        border_style="cyan",
-        padding=(1, 2),
-    ))
+    title = f" VPS Unlock Checker — IPv{version} "
+    pad = W - 2 - len(title)
+    left = pad // 2
+    right = pad - left
 
-    table = Table(
-        show_header=True,
-        header_style="bold white",
-        border_style="dim",
-        padding=(0, 1),
-        expand=True,
-    )
-    table.add_column("Platform", style="bold", ratio=2)
-    table.add_column("Result", ratio=3)
+    print(f"\n{C_CYAN}╭{'─' * left}{C_BOLD}{title}{C_RESET}{C_CYAN}{'─' * right}╮{C_RESET}")
+    for line in lines:
+        visible_len = len(line)
+        padding = W - 2 - visible_len
+        print(f"{C_CYAN}│{C_RESET}{line}{' ' * padding}{C_CYAN}│{C_RESET}")
+    print(f"{C_CYAN}╰{BAR}╯{C_RESET}\n")
 
+    # Results table
+    col1 = 28
+    print(f"  {C_BOLD}{'Platform':<{col1}} {'Result'}{C_RESET}")
+    print(f"  {'─' * (W - 4)}")
     for r in results:
-        table.add_row(r.name, format_status(r))
-
-    console.print(table)
-    console.print()
+        print(f"  {r.name:<{col1}} {format_status(r)}")
+    print()
 
 
 # ── CLI & Main ─────────────────────────────────────────────────────────────────
 
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="VPS Service Unlock Checker",
+        description="VPS Service Unlock Checker (stdlib, zero dependencies)",
     )
     group = parser.add_mutually_exclusive_group()
     group.add_argument("-4", "--ipv4", action="store_true", help="Test IPv4 only")
@@ -630,18 +659,18 @@ def determine_versions(args: argparse.Namespace) -> list[int]:
     return [4, 6]
 
 
-async def run_checks(ctx: CheckContext) -> list[CheckResult]:
-    coros = [check(ctx) for check in ALL_CHECKS]
-    results: list[CheckResult] = list(await asyncio.gather(*coros))
-    return results
+def run_checks(ctx: CheckContext) -> list[CheckResult]:
+    """Run all checks concurrently using threads."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(check, ctx) for check in ALL_CHECKS]
+        return [f.result() for f in futures]
 
 
-async def main() -> None:
+def main() -> None:
     args = parse_args()
-    console = Console()
 
-    console.print("[bold cyan]VPS Unlock Checker[/bold cyan]")
-    console.print()
+    print(f"\n{C_BOLD}{C_CYAN}VPS Unlock Checker{C_RESET}")
+    print()
 
     versions = determine_versions(args)
 
@@ -653,26 +682,26 @@ async def main() -> None:
         else:
             local_addr = "::" if ipv6 else "0.0.0.0"
 
-        async with create_client(local_addr) as client:
-            console.print(f"[dim]Checking IPv{version} connectivity…[/dim]", end=" ")
-            if not await check_connectivity(client):
-                console.print(f"[yellow]No IPv{version} connectivity, skipping.[/yellow]")
-                console.print()
-                continue
-            console.print("[dim]ok.[/dim]")
+        opener = create_opener(local_addr)
 
-            console.print(f"[dim]Fetching IPv{version} info…[/dim]", end=" ")
-            ip_info = await get_ip_info(client)
-            console.print("[dim]done.[/dim]")
+        print(f"{C_DIM}Checking IPv{version} connectivity…{C_RESET}", end=" ", flush=True)
+        if not check_connectivity(opener):
+            print(f"{C_YELLOW}No IPv{version} connectivity, skipping.{C_RESET}")
+            print()
+            continue
+        print(f"{C_DIM}ok.{C_RESET}")
 
-            ctx = CheckContext(client=client, is_ipv6=ipv6)
+        print(f"{C_DIM}Fetching IPv{version} info…{C_RESET}", end=" ", flush=True)
+        ip_info = get_ip_info(opener)
+        print(f"{C_DIM}done.{C_RESET}")
 
-            console.print(f"[dim]Running {len(ALL_CHECKS)} checks…[/dim]")
-            results = await run_checks(ctx)
+        ctx = CheckContext(opener=opener, is_ipv6=ipv6)
 
-            console.print()
-            render_results(console, results, ip_info, version)
+        print(f"{C_DIM}Running {len(ALL_CHECKS)} checks…{C_RESET}", flush=True)
+        results = run_checks(ctx)
+
+        render_results(results, ip_info, version)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
