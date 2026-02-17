@@ -2,7 +2,7 @@
 
 检测 VPS 对主流服务的解锁状态，支持 IPv4/IPv6 双栈。
 
-**零依赖** — 仅使用 Python 3.10+ 标准库，无需 pip install 任何包。
+**零依赖** — 仅使用 Python 3.11+ 标准库，无需 pip install 任何包。
 
 ## 一键运行
 
@@ -39,7 +39,7 @@ python3 check.py -I 1.2.3.4
 
 ## 环境要求
 
-- Python ≥ 3.10
+- Python ≥ 3.11
 - Linux（`-I` 网卡绑定依赖 `ip` 命令）
 
 ## License

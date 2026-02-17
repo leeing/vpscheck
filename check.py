@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """VPS Service Unlock Checker.
 
-Zero dependencies — uses only Python 3.10+ standard library.
+Zero dependencies — uses only Python 3.11+ standard library.
 
 Usage:
     python3 check.py          # test both IPv4 and IPv6
@@ -9,6 +9,7 @@ Usage:
     python3 check.py -6       # IPv6 only
     python3 check.py -I eth0  # bind to specific interface
 """
+
 from __future__ import annotations
 
 import argparse
@@ -16,6 +17,7 @@ import concurrent.futures
 import http.client
 import ipaddress
 import json
+import logging
 import re
 import ssl
 import subprocess
@@ -24,15 +26,16 @@ import time
 import unicodedata
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable
+
+logger = logging.getLogger(__name__)
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 UA_BROWSER = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 )
 UA_SEC_CH_UA = '"Chromium";v="125", "Not-A.Brand";v="24"'
 
@@ -49,6 +52,7 @@ C_RESET = "\033[0m"
 
 
 # ── Data Models ────────────────────────────────────────────────────────────────
+
 
 class CheckStatus(Enum):
     OK = "ok"
@@ -97,6 +101,7 @@ class CheckContext:
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
 
+
 def resolve_interface(name: str, ipv6: bool) -> str:
     """Resolve network interface name to bound IP address (Linux only)."""
     try:
@@ -107,9 +112,11 @@ def resolve_interface(name: str, ipv6: bool) -> str:
     family = "6" if ipv6 else "4"
     kind = "inet6" if ipv6 else "inet"
     try:
-        result = subprocess.run(
-            ["ip", "-o", f"-{family}", "addr", "show", name],
-            capture_output=True, text=True, check=False,
+        result = subprocess.run(  # noqa: S603
+            ["ip", "-o", f"-{family}", "addr", "show", name],  # noqa: S607
+            capture_output=True,
+            text=True,
+            check=False,
         )
         for line in result.stdout.splitlines():
             m = re.search(rf"{kind}\s+(\S+?)/", line)
@@ -126,6 +133,21 @@ def resolve_interface(name: str, ipv6: bool) -> str:
 # ── HTTP Layer (stdlib) ───────────────────────────────────────────────────────
 
 
+def _make_bound_connection(
+    cls: type[http.client.HTTPConnection],
+    host: str,
+    source_address: tuple[str, int] | None,
+    **kwargs: object,
+) -> http.client.HTTPConnection:
+    """Create an HTTP(S)Connection bound to a specific source address.
+
+    Centralises the stdlib type-mismatch workaround (kwargs typed as object
+    but HTTPConnection expects concrete keyword args).
+    """
+    kwargs["source_address"] = source_address
+    return cls(host, **kwargs)  # type: ignore[arg-type]
+
+
 class _BoundHTTPSHandler(urllib.request.HTTPSHandler):
     """HTTPS handler that binds to a specific source address."""
 
@@ -133,13 +155,18 @@ class _BoundHTTPSHandler(urllib.request.HTTPSHandler):
         ctx = ssl.create_default_context()
         super().__init__(context=ctx)
         self._source_address = source_address
+        self._ssl_context = ctx
 
     def https_open(self, req: urllib.request.Request) -> http.client.HTTPResponse:
-        return self.do_open(self._conn, req, context=self._context)
+        return self.do_open(self._conn, req, context=self._ssl_context)
 
     def _conn(self, host: str, **kwargs: object) -> http.client.HTTPSConnection:
-        kwargs["source_address"] = self._source_address  # type: ignore[assignment]
-        return http.client.HTTPSConnection(host, **kwargs)  # type: ignore[arg-type]
+        conn = _make_bound_connection(http.client.HTTPSConnection, host, self._source_address, **kwargs)
+        # HTTPSConnection IS-A HTTPConnection; narrow for mypy.
+        if not isinstance(conn, http.client.HTTPSConnection):  # pragma: no cover
+            msg = "Expected HTTPSConnection"
+            raise TypeError(msg)
+        return conn
 
 
 class _BoundHTTPHandler(urllib.request.HTTPHandler):
@@ -153,16 +180,12 @@ class _BoundHTTPHandler(urllib.request.HTTPHandler):
         return self.do_open(self._conn, req)
 
     def _conn(self, host: str, **kwargs: object) -> http.client.HTTPConnection:
-        kwargs["source_address"] = self._source_address  # type: ignore[assignment]
-        return http.client.HTTPConnection(host, **kwargs)  # type: ignore[arg-type]
+        return _make_bound_connection(http.client.HTTPConnection, host, self._source_address, **kwargs)
 
 
 def create_opener(local_address: str) -> urllib.request.OpenerDirector:
     """Build a urllib opener bound to the given local address."""
-    if local_address in ("0.0.0.0", "::"):
-        source: tuple[str, int] | None = (local_address, 0)
-    else:
-        source = (local_address, 0)
+    source: tuple[str, int] | None = (local_address, 0)
     return urllib.request.build_opener(
         _BoundHTTPHandler(source_address=source),
         _BoundHTTPSHandler(source_address=source),
@@ -181,7 +204,7 @@ def _make_request(url: str, headers: dict[str, str] | None = None) -> urllib.req
         hdrs.update(headers)
     req = urllib.request.Request(url)
     # Bypass add_header() to preserve original header casing
-    req.headers = hdrs  # type: ignore[assignment]
+    req.headers = hdrs
     return req
 
 
@@ -221,12 +244,12 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(
         self,
-        req: urllib.request.Request,
-        fp: object,
-        code: int,
-        msg: str,
-        headers: object,
-        newurl: str,
+        _req: urllib.request.Request,
+        _fp: object,
+        _code: int,
+        _msg: str,
+        _headers: object,
+        _newurl: str,
     ) -> urllib.request.Request | None:
         return None
 
@@ -247,7 +270,7 @@ def fetch_no_redirect(
 
     # Build a new opener with the same handlers + no-redirect handler
     no_redir_opener = urllib.request.build_opener(
-        *[h for h in opener.handlers if not isinstance(h, urllib.request.HTTPRedirectHandler)],
+        *[h for h in opener.handlers if not isinstance(h, urllib.request.HTTPRedirectHandler)],  # type: ignore[attr-defined]
         _NoRedirectHandler,
     )
     for attempt in range(_MAX_RETRIES):
@@ -290,6 +313,7 @@ def get_ip_info(opener: urllib.request.OpenerDirector) -> IPInfo:
 # ── Platform Checks ───────────────────────────────────────────────────────────
 # Each function faithfully replicates the corresponding bash function in
 # check.sh, including all headers, cookies, URLs, and response parsing logic.
+
 
 # --------------------------------------------------------------------------- #
 # 1. WebTest_Reddit (check.sh L3701)
@@ -608,9 +632,9 @@ ALL_CHECKS: list[CheckFn] = [
 # ── Output Rendering (ANSI) ──────────────────────────────────────────────────
 
 STATUS_MAP: dict[CheckStatus, tuple[str, str]] = {
-    CheckStatus.OK:      ("✅", C_GREEN),
-    CheckStatus.NO:      ("❌", C_RED),
-    CheckStatus.FAILED:  ("⚠️ ", C_DIM),
+    CheckStatus.OK: ("✅", C_GREEN),
+    CheckStatus.NO: ("❌", C_RED),
+    CheckStatus.FAILED: ("⚠️ ", C_DIM),
     CheckStatus.WARNING: ("⚡", C_YELLOW),
 }
 
@@ -658,7 +682,7 @@ def _display_width(s: str) -> int:
             i += 1
             continue
         # Check if next char is U+FE0F (emoji presentation selector)
-        has_vs16 = (i + 1 < len(chars) and chars[i + 1] == "\uFE0F")
+        has_vs16 = i + 1 < len(chars) and chars[i + 1] == "\ufe0f"
         eaw = unicodedata.east_asian_width(ch)
         if eaw in ("W", "F") or has_vs16:
             w += 2
@@ -673,8 +697,8 @@ def render_results(
     ip_info: IPInfo,
     version: int,
 ) -> None:
-    W = 62
-    BAR = "─" * (W - 2)
+    box_w = 62
+    bar = "─" * (box_w - 2)
 
     # Header box
     net_label = f"{ip_info.isp} ({ip_info.masked})" if ip_info.isp else ip_info.masked
@@ -687,28 +711,30 @@ def render_results(
 
     title = f" VPS Unlock Checker \u2014 IPv{version} "
     title_w = _display_width(title)
-    pad = W - 2 - title_w
+    pad = box_w - 2 - title_w
     left = pad // 2
     right = pad - left
 
-    print(f"\n{C_CYAN}╭{'─' * left}{C_BOLD}{title}{C_RESET}{C_CYAN}{'─' * right}╮{C_RESET}")
+    logger.info("%s", f"\n{C_CYAN}╭{'─' * left}{C_BOLD}{title}{C_RESET}{C_CYAN}{'─' * right}╮{C_RESET}")
     for line in lines:
         vis_w = _display_width(line)
-        padding = W - 2 - vis_w
-        print(f"{C_CYAN}│{C_RESET}{line}{' ' * max(padding, 0)}{C_CYAN}│{C_RESET}")
-    print(f"{C_CYAN}╰{BAR}╯{C_RESET}\n")
+        padding = box_w - 2 - vis_w
+        logger.info(
+            "%s",
+            f"{C_CYAN}│{C_RESET}{line}{' ' * max(padding, 0)}{C_CYAN}│{C_RESET}",
+        )
+    logger.info("%s", f"{C_CYAN}╰{bar}╯{C_RESET}")
 
     # Results table
     col1 = 28
-    print(f"  {C_BOLD}{'Platform':<{col1}} {'Result'}{C_RESET}")
-    print(f"  {'─' * (W - 4)}")
+    logger.info("%s", f"  {C_BOLD}{'Platform':<{col1}} {'Result'}{C_RESET}")
+    logger.info("%s", f"  {'─' * (box_w - 4)}")
     for r in results:
-        print(f"  {r.name:<{col1}} {format_status(r)}")
-    print()
+        logger.info("%s", f"  {r.name:<{col1}} {format_status(r)}")
+    logger.info("")
 
 
 # ── CLI & Main ─────────────────────────────────────────────────────────────────
-
 
 
 def parse_args() -> argparse.Namespace:
@@ -719,7 +745,8 @@ def parse_args() -> argparse.Namespace:
     group.add_argument("-4", "--ipv4", action="store_true", help="Test IPv4 only")
     group.add_argument("-6", "--ipv6", action="store_true", help="Test IPv6 only")
     parser.add_argument(
-        "-I", "--interface",
+        "-I",
+        "--interface",
         help="Bind to network interface name or IP address",
     )
     return parser.parse_args()
@@ -740,38 +767,47 @@ def run_checks(ctx: CheckContext) -> list[CheckResult]:
         return [f.result() for f in futures]
 
 
+def _configure_logging() -> None:
+    """Configure root logger for CLI output (message-only format)."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(message)s",
+        stream=sys.stdout,
+    )
+
+
 def main() -> None:
+    _configure_logging()
     args = parse_args()
 
-    print(f"\n{C_BOLD}{C_CYAN}VPS Unlock Checker{C_RESET}")
-    print()
+    logger.info("\n%s%sVPS Unlock Checker%s", C_BOLD, C_CYAN, C_RESET)
+    logger.info("")
 
     versions = determine_versions(args)
 
     for version in versions:
         ipv6 = version == 6
 
-        if args.interface:
-            local_addr = resolve_interface(args.interface, ipv6)
-        else:
-            local_addr = "::" if ipv6 else "0.0.0.0"
+        local_addr = (
+            resolve_interface(args.interface, ipv6) if args.interface else "::" if ipv6 else "0.0.0.0"  # noqa: S104
+        )
 
         opener = create_opener(local_addr)
 
-        print(f"{C_DIM}Checking IPv{version} connectivity…{C_RESET}", end=" ", flush=True)
+        logger.info("%sChecking IPv%d connectivity…%s", C_DIM, version, C_RESET)
         if not check_connectivity(opener):
-            print(f"{C_YELLOW}No IPv{version} connectivity, skipping.{C_RESET}")
-            print()
+            logger.info("%sNo IPv%d connectivity, skipping.%s", C_YELLOW, version, C_RESET)
+            logger.info("")
             continue
-        print(f"{C_DIM}ok.{C_RESET}")
+        logger.info("%sok.%s", C_DIM, C_RESET)
 
-        print(f"{C_DIM}Fetching IPv{version} info…{C_RESET}", end=" ", flush=True)
+        logger.info("%sFetching IPv%d info…%s", C_DIM, version, C_RESET)
         ip_info = get_ip_info(opener)
-        print(f"{C_DIM}done.{C_RESET}")
+        logger.info("%sdone.%s", C_DIM, C_RESET)
 
         ctx = CheckContext(opener=opener, is_ipv6=ipv6)
 
-        print(f"{C_DIM}Running {len(ALL_CHECKS)} checks…{C_RESET}", flush=True)
+        logger.info("%sRunning %d checks…%s", C_DIM, len(ALL_CHECKS), C_RESET)
         results = run_checks(ctx)
 
         render_results(results, ip_info, version)

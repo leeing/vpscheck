@@ -1,0 +1,41 @@
+[project]
+name = "vpscheck"
+version = "1.0.0"
+description = "VPS Service Unlock Checker — stdlib only"
+requires-python = ">=3.11"
+
+[dependency-groups]
+dev = ["ruff>=0.9.0", "mypy>=1.14.0"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "S",   # flake8-bandit (security)
+    "ARG", # flake8-unused-arguments
+    "C4",  # flake8-comprehensions
+    "B",   # flake8-bugbear
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+ignore = [
+    "S310", # allow urllib.request.urlopen (core functionality)
+    "S113", # allow missing timeout default (we set it explicitly)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"test_check.py" = ["S101"] # allow assert in tests
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
