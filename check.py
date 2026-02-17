@@ -259,9 +259,26 @@ async def check_netflix(ctx: CheckContext) -> CheckResult:
     if blocked1 and blocked2:
         return CheckResult(name, CheckStatus.WARNING, detail="Originals Only")
 
-    # Extract region from page
-    m = re.search(r'"id":"([^"]*)".*?"countryName":"[^"]*"', t1)
-    region = m.group(1) if m else ""
+    # Extract region — try multiple patterns
+    region = ""
+    # Pattern 1: "currentCountry":"XX"
+    m = re.search(r'"currentCountry"\s*:\s*"([A-Z]{2})"', t1)
+    if m:
+        region = m.group(1)
+    if not region:
+        # Pattern 2: "country":"xx" near geo context
+        m = re.search(r'"country"\s*:\s*"([a-zA-Z]{2})"', t1)
+        if m:
+            region = m.group(1).upper()
+    if not region:
+        # Pattern 3: original bash pattern — "id" near "countryName"
+        # But filter out likely language codes (2-char lowercase like "zh","en")
+        for m_iter in re.finditer(r'"id"\s*:\s*"([^"]+)"[^}]*"countryName"\s*:\s*"([^"]+)"', t1):
+            candidate = m_iter.group(1)
+            # Country codes from Netflix are typically 2 uppercase letters
+            if len(candidate) == 2 and candidate.isalpha():
+                region = candidate.upper()
+                break
     return CheckResult(name, CheckStatus.OK, region=region)
 
 
@@ -310,16 +327,25 @@ async def check_youtube_cdn(ctx: CheckContext) -> CheckResult:
         return CheckResult(name, CheckStatus.FAILED, detail="Empty response")
 
     # Extract IATA from lines with '=>'
+    # Bash: awk '{print $3}' | cut -f2 -d'-' | cut -c 1-3
+    # Note: bash `cut -f2 -d'-'` splits on EACH '-' (no collapsing),
+    # which is different from Python split('-').
     iata = ""
     for line in text.splitlines():
         if "=>" in line:
             parts = line.split()
             if len(parts) >= 3:
-                seg = parts[2].split("-")
-                if len(seg) >= 2:
-                    raw = seg[1]
-                    iata = raw[:3].upper() if len(raw) >= 3 else raw.upper()
-                    break
+                word = parts[2]
+                # Replicate bash `cut -f2 -d'-'`: split on '-', keep 2nd field
+                dash_parts = word.split("-")
+                # Skip empty fields from consecutive dashes
+                non_empty = [p for p in dash_parts if p]
+                if len(non_empty) >= 2:
+                    raw = non_empty[1]
+                    iata = raw[:3].upper()
+                elif len(non_empty) == 1:
+                    iata = non_empty[0][:3].upper()
+                break
 
     if not iata:
         return CheckResult(name, CheckStatus.FAILED, detail="No IATA code")
@@ -506,19 +532,44 @@ async def check_google_captcha(ctx: CheckContext) -> CheckResult:
 async def check_hbo_max(ctx: CheckContext) -> CheckResult:
     name = "HBO Max"
     try:
-        resp = await ctx.client.get("https://www.max.com/")
+        # Use follow_redirects=False so we can read Set-Cookie headers
+        resp = await ctx.client.get("https://www.max.com/", follow_redirects=False)
     except httpx.HTTPError:
         return CheckResult(name, CheckStatus.FAILED, detail="Network")
 
+    # countryCode is in Set-Cookie headers and/or response body
+    region = ""
+    # Check headers first (Set-Cookie: countryCode=XX)
+    for val in resp.headers.get_list("set-cookie"):
+        m = re.search(r"countryCode=([A-Z]{2})", val)
+        if m:
+            region = m.group(1)
+            break
+
+    # Fallback: follow redirect and check body
     text = resp.text
-    # Extract country code
-    m = re.search(r"countryCode=([A-Z]{2})", text)
-    region = m.group(1) if m else ""
+    if not region:
+        # Follow redirects manually to get full body
+        if resp.is_redirect:
+            try:
+                resp2 = await ctx.client.get(str(resp.headers.get("location", "https://www.max.com/")))
+                text = resp2.text
+                for val in resp2.headers.get_list("set-cookie"):
+                    m = re.search(r"countryCode=([A-Z]{2})", val)
+                    if m:
+                        region = m.group(1)
+                        break
+            except httpx.HTTPError:
+                pass
+
+    if not region:
+        m = re.search(r"countryCode=([A-Z]{2})", text)
+        region = m.group(1) if m else ""
 
     if not region:
         return CheckResult(name, CheckStatus.FAILED, detail="Country code not found")
 
-    # Extract available country list
+    # Extract available country list from body
     countries = set(re.findall(r'"url":"/([a-z]{2})/[a-z]{2}"', text))
     countries = {c.upper() for c in countries}
     countries.add("US")
@@ -606,18 +657,49 @@ async def check_discovery_plus(ctx: CheckContext) -> CheckResult:
 
 async def check_hulu(ctx: CheckContext) -> CheckResult:
     name = "Hulu"
+
+    HULU_COOKIE = (
+        "_hulu_at=eyJhbGciOiJSUzI1NiJ9.eyJhc3NpZ25tZW50cyI6ImV5SjJNU0k2VzExOSIsInJlZnJlc2hfaW50ZXJ2YWwiOjg2NDAwMDAwLCJ0b2tlbl9pZCI6IjQyZDk0YzA5LWYyZTEtNDdmNC1iYzU4LWUwNTA2NGNhYTdhZCIsImFub255bW91c19pZCI6IjYzNDUzMjA2LWFmYzgtNDU4Yi1iODBkLWNiMzk2MmYzZGQyZCIsImlzc3VlZF9hdCI6MTcwNjYwOTUzODc5MiwidHRsIjozMTUzNjAwMDAwMCwiZGV2aWNlX3VwcGVyIjoxfQ"
+        ".e7sRCOndgn1j30XYkenLcLSQ7vwc2PXk-gFHMIF2gu_3UNEJ3pp3xNOZMN0n7DQRw5Jv68WiGxIvf65s8AetOoD4NLt4sZUDDz9HCRmFHzpmAJdtXWZ-HZ4fYucENuqDDDrsdQ"
+        "-FCc0mgIe2IXkmQJ6tpIN3Zgcgmpmbeoq6jYyLlqg6f8eMsI1bNAsBGGj-9DXw2PMotlYHWB22pw2NRfJw1TjWXwywRBodAOve7rsu2Vhx-A2-OH4GplRvxLqzCpl2pcjkYg9at"
+        "mUB7jnNIf_jHqlek4oRRawahWq-2vWnWmb1eMQcH-v2IHs3YdVk7I-t4iS19auPQrdgo6jPaA; "
+        "_hulu_assignments=eyJ2MSI6W119; "
+        "XSRF-TOKEN=bcfa1766-1f73-442d-a71b-e1cf6c275f45; "
+        "_customer_type=anonymous; "
+        "guid=B26515EB8A7952D4D35F374465362A72"
+    )
+
+    HULU_RECAPTCHA = (
+        "03AFcWeA6UFet_b_82RUmGfFWJCWuqy6kIn854Rhqjwd7vrkjH6Vku1wBZy8-FBA3Efx1p2cuNnKeJRuk7yJWm-xZgFfUx0Wdj2OAhiGvIdWrcpfeuQSXEqaXH4FKdmAHVZ3EqHwe5"
+        "-h_zgtcyIxq-Nn1-sjeUfx1Y7QyVkb_GWJcr0GLoKgTFLzbF4kmJ8Qsi4IFx9hyYo9TFbBqtYdgxCI2q9DnEzOHrxK-987PEY8qzsR08Hrb9oDvumqLp1gs4uEVTwDKWt37aNB3CMV"
+        "BKL2lHj7n768kXpgkXFDIhcM2eiJJ-H22qxKzNUpg-Q_N1xzkYsavCJG3ckQgsCTRRP2NU3nIERTWDTVXRBEq52-_ZQWu_Ds4W4UZyP0hEhCD2gambN4YJqEzaeHdGPwOR943nFbG6GI"
+        "LBx4vY-UUc7zjMf2HRjkNPvPpQiHMIYo21JXq6l8-IWyTeHY26NU6M4vCCbzwZEsdSln48rXM_fdBcDHC-8AxUFuBR8j3DMsB6Q3xMS2EHeGVrmhDY1izDNJZsVC_cN0W2tRneOJmni"
+        "7ZU1iAYoBAGBBM5FDTE4UbYUTnuUn-htm9Q0RzukpYTumF_WwQ3HnEL0JK1Q1xea-hteI8lB4oAkhVOBOHVPii9atdZR9ZLpxRh1pdy3Lwmr1ltsubxE05wqmrmt33P2WsvH_3nBJXC_Fh"
+        "TD06BxT60RuiGtFr2gscHjjl_NCa1F-Dv9Hgi5ek2nLHK37a84bRSoKwLL3Lnpi9byuBntlpf-UXj7nveawKZmZTUBOSc7j6Vmmf124DTPJXsFeofMfUXkqTauPTWJBOz0OdKnLKDHMSs"
+        "k7oSJVKsDUEeq0iKMdtCMBPvQBaPYAb79LDRwv_ereqyklKcUKQxeZRZmEXLKIWp8BS4U9uTXA2w8hwZWe7goLnUBQATIwojeHKpypSLnzQBu9JCwMU4aXfKIplL8sXuAx3QFD52eGZSCE"
+        "yuFXP3ACN53QOlTAjjlP2eDT9fEwWHT4o8eJfviyjvm8xDmzKtq4F3u5XB3tL86-dK40XYbGcTI0Irw1nz1UTcxplFgHQgb6i8WEAqb69CQkpGWAUlmnknBirRAv2adqPaW2d_lv6L3E"
+        "o-ZupWcZ9Cu4PibM5BruVNXifBwPNPXHKw-sWBj-UP1g9VtxHVEVwoTXrbB-lT8EvjDEDQKrvOwnri4_tzVzn6YKvQMELbxSegvmc2w7xypT2qFzKRFXqwTMLT9d0rf2p9tbwbe39REMR8"
+        "oI7wPfbjyJjK2XF4DmEAyVvBMuJlBaBsKBs5VynITHFWs4xvkAOe4jO_fzkKXzB6F6DB03ldasxbrNK_cepUOF6FD39-pHvbAGcoTrDrx6FSfecYXwSvc3GxM3IHSKwISKWav2iqPMtIt6"
+        "ClCgUPgTCBDng2ZptXeVG8FckGIGMEdVlgGt5DG2tdMO2p8Hs5tKXuu8anc_csaaSfLIQ1_kav0dp8vpSXhCxeg899o5coXderUoIBcUsfaBJJm80YnCAc4LaM8HmYtJBcKqCC_uwCckPDOu"
+        "C0SQy3d07LEi6wyifvY0Kv_-ER6wXvhNWnDZIXJNlH2369X7y8o3y2HMisOwAhfmKN7_ZAaODEOO-5x9JHocAYnt4a8_focwU9JQ_hUQgtdzYpP1ACEqxVjJb0A0NlABpm-CG8V9n9y6Xp"
+        "ZkGQiMYJIH3jr6VilHSEM9rQSEv6LN8NFigl3-5Y4Ri7W4joz3LUMQcjFj3qXd3AXonarXhwglVNB9BYquCdA5eq4wVUeAkm3R-e56TK5IZwpb5wNJDO3PhuXHSMwv1k-NEAIfI9_w"
+    )
+
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+        "Cookie": HULU_COOKIE,
         "Origin": "https://www.hulu.com",
         "Referer": "https://www.hulu.com/welcome",
         "sec-ch-ua": UA_SEC_CH_UA,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
     }
     form_data = (
         "user_email=me%40jamchoi.cc"
         "&password=Jam0.5cm~"
         "&recaptcha_type=web_invisible"
-        "&rrventerprise=03AFcWeA6UFet_b_82RUmGfFWJCWuqy6kIn854Rhqjwd7vrkjH6Vku1wBZy8"
+        f"&rrventerprise={HULU_RECAPTCHA}"
         "&scenario=web_password_login"
         "&csrf=c2c20e89ce4e314771dcda79994b2cd020b9c30fc25faccdc1ebef3351a5b36b"
     )
