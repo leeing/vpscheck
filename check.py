@@ -644,18 +644,27 @@ def _display_width(s: str) -> int:
 
     Emojis and wide characters occupy 2 columns but len() counts them as 1.
     Variation selectors and combining marks occupy 0 columns.
+    A character followed by U+FE0F (emoji presentation selector) is forced
+    to 2 columns wide, even if its East Asian Width is Narrow.
     """
     w = 0
-    for ch in s:
+    chars = list(s)
+    i = 0
+    while i < len(chars):
+        ch = chars[i]
         cat = unicodedata.category(ch)
-        # Zero-width: combining marks, format chars, variation selectors
+        # Zero-width: combining marks, format chars (includes variation selectors)
         if cat.startswith("M") or cat == "Cf":
+            i += 1
             continue
+        # Check if next char is U+FE0F (emoji presentation selector)
+        has_vs16 = (i + 1 < len(chars) and chars[i + 1] == "\uFE0F")
         eaw = unicodedata.east_asian_width(ch)
-        if eaw in ("W", "F"):
+        if eaw in ("W", "F") or has_vs16:
             w += 2
         else:
             w += 1
+        i += 1
     return w
 
 
