@@ -1,0 +1,121 @@
+name: Upstream Sync Check
+on:
+  schedule:
+    - cron: '0 8 * * 1'  # Every Monday 08:00 UTC
+  workflow_dispatch:       # Manual trigger
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone upstream & compare function hashes
+        id: diff
+        run: |
+          git clone --depth=50 https://github.com/lmc999/RegionRestrictionCheck.git /tmp/upstream
+
+          python3 << 'PYEOF'
+          import hashlib, re, os
+
+          with open("/tmp/upstream/check.sh", "r") as f:
+              content = f.read()
+
+          functions = [
+              "WebTest_Reddit",
+              "MediaUnlockTest_YouTube_Premium",
+              "RegionTest_Apple",
+              "WebTest_OpenAI",
+              "WebTest_Gemini",
+              "WebTest_Claude",
+              "WebTest_GooglePlayStore",
+              "WebTest_GoogleSearchCAPTCHA",
+          ]
+
+          # Load old hashes
+          old_hashes: dict[str, str] = {}
+          hash_file = ".upstream-hashes"
+          if os.path.exists(hash_file):
+              with open(hash_file) as f:
+                  for line in f:
+                      line = line.strip()
+                      if "=" in line:
+                          k, v = line.split("=", 1)
+                          old_hashes[k] = v
+
+          # Compute new hashes
+          new_lines: list[str] = []
+          changed: list[str] = []
+          for func in functions:
+              pattern = rf"function {func}\(\) \{{.*?\n\}}"
+              m = re.search(pattern, content, re.DOTALL)
+              if not m:
+                  print(f"WARNING: {func} not found in upstream check.sh")
+                  continue
+              h = hashlib.sha256(m.group(0).encode()).hexdigest()
+              new_lines.append(f"{func}={h}")
+              if func in old_hashes and old_hashes[func] != h:
+                  changed.append(func)
+
+          # Save new hashes
+          with open(hash_file, "w") as f:
+              f.write("\n".join(new_lines) + "\n")
+
+          # Write outputs for GitHub Actions
+          gh_output = os.environ.get("GITHUB_OUTPUT", "")
+          if gh_output:
+              with open(gh_output, "a") as f:
+                  if changed:
+                      f.write("changed=true\n")
+                      f.write("functions<<EOF\n")
+                      for fn in changed:
+                          f.write(f"- `{fn}`\n")
+                      f.write("EOF\n")
+                  else:
+                      f.write("changed=false\n")
+
+          if changed:
+              print(f"⚠️  {len(changed)} function(s) changed: {', '.join(changed)}")
+          else:
+              print("✅ All 8 functions unchanged")
+          PYEOF
+
+      - name: Commit updated hashes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .upstream-hashes
+          git diff --cached --quiet || git commit -m "chore: update upstream function hashes"
+          git push || true
+
+      - name: Create Issue on changes
+        if: steps.diff.outputs.changed == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const functions = `${{ steps.diff.outputs.functions }}`;
+            const upstream = 'https://github.com/lmc999/RegionRestrictionCheck/blob/main/check.sh';
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: '⚠️ Upstream check.sh detection logic changed',
+              labels: ['sync'],
+              body: [
+                '## Upstream Functions Changed',
+                '',
+                'The following bash functions in [check.sh](' + upstream + ') have changed since our last sync:',
+                '',
+                functions,
+                '',
+                '### Action Required',
+                '',
+                '1. Review the upstream changes: `cd RegionRestrictionCheck && git pull`',
+                '2. Compare each changed function against `check.py`',
+                '3. Update `check.py` to match the new logic',
+                '4. Push changes — the hash file will auto-update on the next CI run',
+              ].join('\n'),
+            });

@@ -20,6 +20,7 @@ import re
 import ssl
 import subprocess
 import sys
+import time
 import unicodedata
 import urllib.error
 import urllib.request
@@ -184,8 +185,9 @@ def _make_request(url: str, headers: dict[str, str] | None = None) -> urllib.req
     return req
 
 
-# Retry count matching bash CURL_DEFAULT_OPTS (--retry 3)
+# Retry matching bash CURL_DEFAULT_OPTS (--retry 3, ~1s default interval)
 _MAX_RETRIES = 3
+_RETRY_DELAY = 1  # seconds between retries
 
 
 def fetch(
@@ -210,6 +212,7 @@ def fetch(
         except (urllib.error.URLError, OSError, TimeoutError):
             if attempt == _MAX_RETRIES - 1:
                 return None
+            time.sleep(_RETRY_DELAY)
     return None
 
 
@@ -258,6 +261,7 @@ def fetch_no_redirect(
         except (urllib.error.URLError, OSError, TimeoutError):
             if attempt == _MAX_RETRIES - 1:
                 return None
+            time.sleep(_RETRY_DELAY)
     return None
 
 
@@ -556,7 +560,8 @@ def check_google_play(ctx: CheckContext) -> CheckResult:
         "upgrade-insecure-requests": "1",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     }
-    resp = fetch(ctx.opener, "https://play.google.com/", headers=headers)
+    # Google Play page is ~1.3MB; give VPS with low bandwidth more time
+    resp = fetch(ctx.opener, "https://play.google.com/", headers=headers, timeout=15)
     if resp is None:
         return CheckResult(name, CheckStatus.FAILED, detail="Network Connection")
 
