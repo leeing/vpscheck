@@ -167,26 +167,49 @@ def create_opener(local_address: str) -> urllib.request.OpenerDirector:
     )
 
 
+def _make_request(url: str, headers: dict[str, str] | None = None) -> urllib.request.Request:
+    """Build a Request preserving exact header casing.
+
+    urllib.request.Request.add_header() calls str.capitalize() on keys,
+    which turns 'sec-ch-ua' into 'Sec-ch-ua'. This breaks Google's browser
+    fingerprinting. We bypass this by writing to req.headers directly.
+    """
+    hdrs = {"User-Agent": UA_BROWSER}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url)
+    # Bypass add_header() to preserve original header casing
+    req.headers = hdrs  # type: ignore[assignment]
+    return req
+
+
+# Retry count matching bash CURL_DEFAULT_OPTS (--retry 3)
+_MAX_RETRIES = 3
+
+
 def fetch(
     opener: urllib.request.OpenerDirector,
     url: str,
     headers: dict[str, str] | None = None,
     timeout: int = TIMEOUT,
 ) -> Response | None:
-    """GET a URL; returns Response on success (including 4xx/5xx), None on error."""
-    hdrs = {"User-Agent": UA_BROWSER}
-    if headers:
-        hdrs.update(headers)
-    req = urllib.request.Request(url, headers=hdrs)
-    try:
-        resp = opener.open(req, timeout=timeout)
-        body = resp.read().decode("utf-8", errors="replace")
-        return Response(resp.status, body, resp.url)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        return Response(e.code, body, url)
-    except (urllib.error.URLError, OSError, TimeoutError):
-        return None
+    """GET a URL; returns Response on success (including 4xx/5xx), None on error.
+
+    Retries up to 3 times on network failure, matching bash --retry 3.
+    """
+    req = _make_request(url, headers)
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = opener.open(req, timeout=timeout)
+            body = resp.read().decode("utf-8", errors="replace")
+            return Response(resp.status, body, resp.url)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            return Response(e.code, body, url)
+        except (urllib.error.URLError, OSError, TimeoutError):
+            if attempt == _MAX_RETRIES - 1:
+                return None
+    return None
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -214,26 +237,27 @@ def fetch_no_redirect(
 
     Builds a one-off opener that inherits the source-address-bound handlers
     from the original opener but adds _NoRedirectHandler to suppress redirects.
+    Retries up to 3 times on network failure.
     """
-    hdrs = {"User-Agent": UA_BROWSER}
-    if headers:
-        hdrs.update(headers)
-    req = urllib.request.Request(url, headers=hdrs)
+    req = _make_request(url, headers)
 
     # Build a new opener with the same handlers + no-redirect handler
     no_redir_opener = urllib.request.build_opener(
         *[h for h in opener.handlers if not isinstance(h, urllib.request.HTTPRedirectHandler)],
         _NoRedirectHandler,
     )
-    try:
-        resp = no_redir_opener.open(req, timeout=timeout)
-        body = resp.read().decode("utf-8", errors="replace")
-        return Response(resp.status, body, resp.url)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        return Response(e.code, body, url)
-    except (urllib.error.URLError, OSError, TimeoutError):
-        return None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            resp = no_redir_opener.open(req, timeout=timeout)
+            body = resp.read().decode("utf-8", errors="replace")
+            return Response(resp.status, body, resp.url)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            return Response(e.code, body, url)
+        except (urllib.error.URLError, OSError, TimeoutError):
+            if attempt == _MAX_RETRIES - 1:
+                return None
+    return None
 
 
 def check_connectivity(opener: urllib.request.OpenerDirector) -> bool:
