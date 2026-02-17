@@ -20,6 +20,7 @@ import re
 import ssl
 import subprocess
 import sys
+import unicodedata
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -673,6 +674,26 @@ def format_status(r: CheckResult) -> str:
     return f"{color}{icon} {label}{C_RESET}"
 
 
+def _display_width(s: str) -> int:
+    """Calculate terminal display width of a string.
+
+    Emojis and wide characters occupy 2 columns but len() counts them as 1.
+    Variation selectors and combining marks occupy 0 columns.
+    """
+    w = 0
+    for ch in s:
+        cat = unicodedata.category(ch)
+        # Zero-width: combining marks, format chars, variation selectors
+        if cat.startswith("M") or cat == "Cf":
+            continue
+        eaw = unicodedata.east_asian_width(ch)
+        if eaw in ("W", "F"):
+            w += 2
+        else:
+            w += 1
+    return w
+
+
 def render_results(
     results: list[CheckResult],
     ip_info: IPInfo,
@@ -690,16 +711,17 @@ def render_results(
         lines.append(f"  🏳️   Country:  {ip_info.country}")
     lines.append(f"  📡  Protocol: IPv{version}")
 
-    title = f" VPS Unlock Checker — IPv{version} "
-    pad = W - 2 - len(title)
+    title = f" VPS Unlock Checker \u2014 IPv{version} "
+    title_w = _display_width(title)
+    pad = W - 2 - title_w
     left = pad // 2
     right = pad - left
 
     print(f"\n{C_CYAN}╭{'─' * left}{C_BOLD}{title}{C_RESET}{C_CYAN}{'─' * right}╮{C_RESET}")
     for line in lines:
-        visible_len = len(line)
-        padding = W - 2 - visible_len
-        print(f"{C_CYAN}│{C_RESET}{line}{' ' * padding}{C_CYAN}│{C_RESET}")
+        vis_w = _display_width(line)
+        padding = W - 2 - vis_w
+        print(f"{C_CYAN}│{C_RESET}{line}{' ' * max(padding, 0)}{C_CYAN}│{C_RESET}")
     print(f"{C_CYAN}╰{BAR}╯{C_RESET}\n")
 
     # Results table
