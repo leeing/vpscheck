@@ -15,7 +15,7 @@ curl -sL https://raw.githubusercontent.com/leeing/vpscheck/refs/heads/main/check
 | 类别 | 平台 |
 |------|------|
 | AI 服务 | ChatGPT · Google Gemini · Claude |
-| Google | Google Play Store · Google Search CAPTCHA Free · YouTube Premium |
+| Google | Google Search CAPTCHA Free · YouTube Premium |
 | 其他 | Reddit · Apple Region |
 
 ## 使用方式
