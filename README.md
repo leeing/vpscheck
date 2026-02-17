@@ -4,6 +4,12 @@
 
 **零依赖** — 仅使用 Python 3.10+ 标准库，无需 pip install 任何包。
 
+## 一键运行
+
+```bash
+curl -sL https://raw.githubusercontent.com/leeing/vpscheck/refs/heads/main/check.py | python3
+```
+
 ## 支持平台
 
 | 类别 | 平台 |
@@ -12,21 +18,23 @@
 | Google | Google Play Store · Google Search CAPTCHA Free · YouTube Premium |
 | 其他 | Reddit · Apple Region |
 
-## 快速开始
-
-```bash
-# 只需 Python 3.10+，无需任何第三方依赖
-python3 check.py
-```
-
 ## 使用方式
 
 ```bash
-python3 check.py          # 双栈测试（IPv4 + IPv6）
-python3 check.py -4       # 仅 IPv4
-python3 check.py -6       # 仅 IPv6
-python3 check.py -I eth0  # 绑定网卡
-python3 check.py -I 1.2.3.4  # 绑定 IP
+# 一键运行（推荐）
+curl -sL https://raw.githubusercontent.com/leeing/vpscheck/refs/heads/main/check.py | python3
+
+# 带参数
+curl -sL https://raw.githubusercontent.com/leeing/vpscheck/refs/heads/main/check.py | python3 - -4       # 仅 IPv4
+curl -sL https://raw.githubusercontent.com/leeing/vpscheck/refs/heads/main/check.py | python3 - -6       # 仅 IPv6
+curl -sL https://raw.githubusercontent.com/leeing/vpscheck/refs/heads/main/check.py | python3 - -I eth0  # 绑定网卡
+
+# 本地运行
+python3 check.py
+python3 check.py -4
+python3 check.py -6
+python3 check.py -I eth0
+python3 check.py -I 1.2.3.4
 ```
 
 ## 环境要求
