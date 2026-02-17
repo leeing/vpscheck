@@ -275,5 +275,69 @@ class TestCheckGoogleCaptcha(unittest.TestCase):
         assert r.status == CheckStatus.NO
 
 
+class TestCheckChatGPTEdgeCases(unittest.TestCase):
+    """Edge cases for check_chatgpt."""
+
+    @patch("check.fetch_no_redirect")
+    def test_vpn_case_insensitive(self, mock_fetch: MagicMock) -> None:
+        """Upstream bash uses grep -i 'VPN' (case-insensitive)."""
+        mock_fetch.side_effect = [
+            Response(200, "cookie compliance ok", ""),
+            Response(200, "vpn detected lowercase", ""),
+        ]
+        r = check_chatgpt(_make_ctx())
+        assert r.status == CheckStatus.WARNING
+        assert "Web Browser" in r.detail
+
+
+class TestCheckGoogleCaptchaEdgeCases(unittest.TestCase):
+    """Edge cases for check_google_captcha."""
+
+    @patch("check.fetch")
+    def test_both_blocked_and_ok(self, mock_fetch: MagicMock) -> None:
+        """When both 'curl' and 'unusual traffic' appear, blocked takes priority."""
+        mock_fetch.return_value = Response(200, "curl page with unusual traffic from your network", "")
+        r = check_google_captcha(_make_ctx())
+        assert r.status == CheckStatus.NO
+
+
+class TestCheckYouTubePremiumEdgeCases(unittest.TestCase):
+    """Edge cases for check_youtube_premium."""
+
+    @patch("check.fetch")
+    def test_not_available_with_region(self, mock_fetch: MagicMock) -> None:
+        """Region is captured even when premium is not available."""
+        body = '"INNERTUBE_CONTEXT_GL":"JP" Premium is not available in your country'
+        mock_fetch.return_value = Response(200, body, "")
+        r = check_youtube_premium(_make_ctx())
+        assert r.status == CheckStatus.NO
+        assert r.region == "JP"
+
+
+class TestResolveInterface(unittest.TestCase):
+    """Tests for resolve_interface."""
+
+    def test_direct_ip(self) -> None:
+        """An IP address string is returned as-is."""
+        from check import resolve_interface
+
+        assert resolve_interface("192.168.1.1", ipv6=False) == "192.168.1.1"
+
+    def test_direct_ipv6(self) -> None:
+        """An IPv6 address string is returned as-is."""
+        from check import resolve_interface
+
+        assert resolve_interface("::1", ipv6=True) == "::1"
+
+    @patch("check.subprocess.run")
+    def test_file_not_found(self, mock_run: MagicMock) -> None:
+        """When 'ip' command is not found, exits gracefully."""
+        from check import resolve_interface
+
+        mock_run.side_effect = FileNotFoundError
+        with self.assertRaises(SystemExit):
+            resolve_interface("eth0", ipv6=False)
+
+
 if __name__ == "__main__":
     unittest.main()

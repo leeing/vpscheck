@@ -81,7 +81,7 @@ jobs:
           if changed:
               print(f"⚠️  {len(changed)} function(s) changed: {', '.join(changed)}")
           else:
-              print("✅ All 8 functions unchanged")
+              print("✅ All 7 functions unchanged")
           PYEOF
 
       - name: Commit updated hashes

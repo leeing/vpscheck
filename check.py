@@ -479,7 +479,7 @@ def check_chatgpt(ctx: CheckContext) -> CheckResult:
     # grep -i 'unsupported_country'
     has_unsupported = bool(re.search(r"unsupported_country", resp1.text, re.IGNORECASE))
     # grep -i 'VPN'
-    has_vpn = bool(re.search(r"VPN", resp2.text))
+    has_vpn = bool(re.search(r"VPN", resp2.text, re.IGNORECASE))
 
     if not has_unsupported and not has_vpn:
         return CheckResult(name, CheckStatus.OK)
